@@ -44,7 +44,7 @@ GLOBAL_TOKEN_REFRESH_TIME = 0.0
 GLOBAL_U_PATH = "u/0/"
 
 GLOBAL_NATIVE_CONTEXT = ("", "", "", "")
-GLOBAL_LAST_MSG_TEXT = ""  # Used for Delta Slicing
+GLOBAL_LAST_BLOCKS = []
 
 request_lock = threading.Lock()
 _response_cache: dict = {}
@@ -287,7 +287,7 @@ async def count_tokens(req: Request):
 
 @app.post("/v1/messages")
 def anthropic_messages(req: AnthropicRequest):
-    global GLOBAL_NATIVE_CONTEXT, GLOBAL_LAST_MSG_TEXT
+    global GLOBAL_NATIVE_CONTEXT, GLOBAL_LAST_BLOCKS
     model_name, model_hex = MODELS[DEFAULT_MODEL]
 
     req_dump = ""
@@ -305,11 +305,11 @@ def anthropic_messages(req: AnthropicRequest):
     with request_lock:
         print(f"\n[*] Processing request from Claude Code.")
 
-        # Detect if Claude Code cleared the terminal/history so we can reset Google too!
+        # Detect if Claude Code cleared the terminal/history so we can reset Google too
         if len(req.messages) == 1 and GLOBAL_NATIVE_CONTEXT[0]:
             print("[*] Claude Code started a new chat. Resetting Google Context...")
             GLOBAL_NATIVE_CONTEXT = ("", "", "", "")
-            GLOBAL_LAST_MSG_TEXT = ""
+            GLOBAL_LAST_BLOCKS = []
 
         # 1. EXTRACT CLAUDE'S NATIVE SYSTEM PROMPT
         sys_prompt = ""
@@ -317,8 +317,7 @@ def anthropic_messages(req: AnthropicRequest):
             if isinstance(req.system, str):
                 sys_prompt = req.system
             elif isinstance(req.system, list):
-                sys_prompt = "\n".join(
-                    [b.get("text", "") for b in req.system if isinstance(b, dict) and b.get("type") == "text"])
+                sys_prompt = "\n".join([b.get("text", "") for b in req.system if isinstance(b, dict) and b.get("type") == "text"])
 
         # 2. INJECT TOOLS
         tools_prompt = ""
@@ -336,68 +335,93 @@ def anthropic_messages(req: AnthropicRequest):
                 "- Use 4-space indentation encoded as spaces (not tabs).\n\n"
             )
 
-        # 3. BUILD THE CONCATENATED MESSAGE BLOCK
+        # -------------------------------------------------------
+        # 🌟 THE ARRAY DELTA SLICER (100% BULLETPROOF) 🌟
+        # -------------------------------------------------------
         last_msg = req.messages[-1]
-        current_msg_text = ""
-        last_tool_name = ""
+        current_blocks_raw = []
 
         if isinstance(last_msg.content, str):
-            current_msg_text = last_msg.content
+            current_blocks_raw = [{"type": "text", "text": last_msg.content}]
         elif isinstance(last_msg.content, list):
-            for block in last_msg.content:
-                if not isinstance(block, dict): continue
-                btype = block.get("type")
+            current_blocks_raw = last_msg.content
 
-                if btype == "text":
-                    current_msg_text += block.get("text", "") + "\n"
-                elif btype == "tool_use":
-                    last_tool_name = block.get("name", "")
-                    current_msg_text += f"\n[You requested Tool: {last_tool_name}]\n"
-                elif btype == "tool_result":
-                    raw_content = str(block.get('content', ''))
-                    clean_content = _format_tool_result(raw_content, last_tool_name)
-                    current_msg_text += f"\n[Tool Output Result]:\n{clean_content}\n"
+        # Create string signatures for prefix matching
+        current_block_sigs = [str(b) for b in current_blocks_raw]
+
+        # Find how many blocks we've already sent to Google
+        match_idx = 0
+        if GLOBAL_NATIVE_CONTEXT[0]:
+            for i in range(min(len(GLOBAL_LAST_BLOCKS), len(current_block_sigs))):
+                if GLOBAL_LAST_BLOCKS[i] == current_block_sigs[i]:
+                    match_idx += 1
+                else:
+                    break
+
+        # Slice off everything we've already sent!
+        new_blocks = current_blocks_raw[match_idx:]
+        GLOBAL_LAST_BLOCKS = current_block_sigs
+
+        # 3. BUILD THE DELTA MESSAGE (Only the new stuff)
+        msg_to_send = ""
+        has_user_text = False
+
+        for block in new_blocks:
+            if not isinstance(block, dict): continue
+            btype = block.get("type")
+            if btype == "text":
+                text_val = block.get("text", "")
+                if text_val.strip(): has_user_text = True
+                msg_to_send += text_val + "\n"
+            elif btype == "tool_use":
+                msg_to_send += f"\n[You requested Tool: {block.get('name')}]\n"
+            elif btype == "tool_result":
+                raw_content = str(block.get('content', ''))
+                msg_to_send += f"\n[Tool Output Result]:\n{_format_tool_result(raw_content, block.get('name', ''))}\n"
+
+        # 3.5 BUILD FULL MESSAGE (Just in case we need to Auto-Heal)
+        full_msg_text = ""
+        for block in current_blocks_raw:
+            if not isinstance(block, dict): continue
+            btype = block.get("type")
+            if btype == "text":
+                full_msg_text += block.get("text", "") + "\n"
+            elif btype == "tool_use":
+                full_msg_text += f"\n[You requested Tool: {block.get('name')}]\n"
+            elif btype == "tool_result":
+                raw_content = str(block.get('content', ''))
+                full_msg_text += f"\n[Tool Output Result]:\n{_format_tool_result(raw_content, block.get('name', ''))}\n"
 
         # Scrub hidden bloat
         sys_prompt = re.sub(r'<system-reminder>.*?</system-reminder>', '', sys_prompt, flags=re.DOTALL)
-        current_msg_text = re.sub(r'<system-reminder>.*?</system-reminder>', '', current_msg_text, flags=re.DOTALL)
-        current_msg_text = re.sub(r'===.*?===', '', current_msg_text, flags=re.DOTALL).strip()
+        msg_to_send = re.sub(r'<system-reminder>.*?</system-reminder>', '', msg_to_send, flags=re.DOTALL).strip()
+        full_msg_text = re.sub(r'<system-reminder>.*?</system-reminder>', '', full_msg_text, flags=re.DOTALL).strip()
 
-        # -------------------------------------------------------
-        # 🌟 THE DELTA SLICER (FIXES THE INFINITE LOOP BUG) 🌟
-        # -------------------------------------------------------
-        msg_to_send = current_msg_text
-        if GLOBAL_NATIVE_CONTEXT[0] and GLOBAL_LAST_MSG_TEXT:
-            if current_msg_text.startswith(GLOBAL_LAST_MSG_TEXT):
-                delta = current_msg_text[len(GLOBAL_LAST_MSG_TEXT):].strip()
-                if delta:
-                    msg_to_send = delta
-                    print(f"[*] Extracted Delta ({len(delta)} chars) to send.")
-                else:
-                    msg_to_send = ""  # No new info, prevent empty prompt error
-            else:
-                print("[*] Message diverged from history. Sending full block.")
+        # Stop signal to prevent autonomous looping
+        if not has_user_text and msg_to_send:
+            stop_signal = "\n\n[Tools executed successfully. Await next user instruction before taking further actions.]"
+            msg_to_send += stop_signal
+            full_msg_text += stop_signal
+            print("[~] Pure tool-result message — added stop signal to prevent Gemini looping.")
 
-        # Save the current state for the next turn!
-        GLOBAL_LAST_MSG_TEXT = current_msg_text
-
-        # If there is absolutely no new delta to send, return the cached result to prevent a crash
-        cache_key_full = _cache_key(current_msg_text)
-        cached_full = _cache_get(cache_key_full)
-        if not msg_to_send and cached_full:
-            print(f"[~] No new delta detected. Returning cached response.")
-            return cached_full
-        elif not msg_to_send:
+        # Check Cache
+        cache_key_full = _cache_key(str(current_block_sigs))
+        if not msg_to_send:
+            cached_full = _cache_get(cache_key_full)
+            if cached_full:
+                print(f"[~] No new array delta detected. Returning cached response.")
+                return cached_full
             msg_to_send = "[Awaiting next instructions]"
+            full_msg_text = "[Awaiting next instructions]"
 
         # 4. CONSTRUCT PROMPT
-        if not GLOBAL_NATIVE_CONTEXT[0]:
-            injected_prompt = f"[SYSTEM INSTRUCTIONS]\n{sys_prompt.strip()}\n\n{tools_prompt}\n[LATEST MESSAGE]\n{msg_to_send}"
-            print("[*] First turn — sending system prompt + message.")
+        if not GLOBAL_NATIVE_CONTEXT[0] or match_idx == 0:
+            injected_prompt = f"[SYSTEM INSTRUCTIONS]\n{sys_prompt.strip()}\n\n{tools_prompt}\n[LATEST MESSAGE]\n{full_msg_text}"
+            print(f"[*] Sending Full Context block ({len(new_blocks)} new items).")
         else:
             lean_reminder = "Reminder: To execute a tool, reply EXACTLY with: <TOOL_CALL>{\"name\": \"...\", \"input\": {...}}</TOOL_CALL>\n\n"
             injected_prompt = f"{lean_reminder}[NEW EVENT]\n{msg_to_send}"
-            print(f"[*] Active Session: Sending DELTA to Chat ID: {GLOBAL_NATIVE_CONTEXT[0][:10]}...")
+            print(f"[*] Sending DELTA ARRAY SLICE ({len(new_blocks)} new items) to Chat ID: {GLOBAL_NATIVE_CONTEXT[0][:10]}...")
 
         injected_prompt = re.sub(r'\n{3,}', '\n\n', injected_prompt).strip()
 
@@ -413,10 +437,11 @@ def anthropic_messages(req: AnthropicRequest):
                 print(f"[-] Context Desync / Auth Error (status={status}). Auto-healing...")
                 get_at_token()
                 GLOBAL_NATIVE_CONTEXT = ("", "", "", "")
-                GLOBAL_LAST_MSG_TEXT = ""  # Reset delta slicer
+                GLOBAL_LAST_BLOCKS = []
 
-                # Retry with full context
-                heal_prompt = f"[SYSTEM INSTRUCTIONS]\n{sys_prompt.strip()}\n\n{tools_prompt}\n[LATEST MESSAGE]\n{current_msg_text}"
+                # CRITICAL FIX: If we heal, we MUST send the FULL history, not just the delta!
+                heal_prompt = f"[SYSTEM INSTRUCTIONS]\n{sys_prompt.strip()}\n\n{tools_prompt}\n[LATEST MESSAGE]\n{full_msg_text}"
+                heal_prompt = re.sub(r'\n{3,}', '\n\n', heal_prompt).strip()
                 raw_resp, status = send_native_message(heal_prompt, model_hex, GLOBAL_NATIVE_CONTEXT)
         else:
             raw_resp, status = send_guest_message(injected_prompt, model_hex)
@@ -442,12 +467,9 @@ def anthropic_messages(req: AnthropicRequest):
         content_blocks = []
         stop_reason = "end_turn"
 
-        response_text = response_text.replace('\\u003c', '<').replace('\\u003e', '>').replace('\u003c', '<').replace(
-            '\u003e', '>')
+        response_text = response_text.replace('\\u003c', '<').replace('\\u003e', '>').replace('\u003c', '<').replace('\u003e', '>')
 
-        # CRITICAL FIX: Using finditer to execute multiple tools in a single response!
-        tool_matches = list(
-            re.finditer(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', response_text, re.DOTALL | re.IGNORECASE))
+        tool_matches = list(re.finditer(r'<TOOL_CALL>\s*(\{.*?\})\s*</TOOL_CALL>', response_text, re.DOTALL | re.IGNORECASE))
 
         if tool_matches:
             pre_text = response_text[:tool_matches[0].start()].strip()
@@ -459,8 +481,7 @@ def anthropic_messages(req: AnthropicRequest):
                     if "input" in tool_data and isinstance(tool_data["input"], dict):
                         for key in ["command", "content", "new_string", "old_string", "file_path"]:
                             if key in tool_data["input"] and isinstance(tool_data["input"][key], str):
-                                tool_data["input"][key] = tool_data["input"][key].replace('\\"', '"').replace('\\n',
-                                                                                                              '\n')
+                                tool_data["input"][key] = tool_data["input"][key].replace('\\"', '"').replace('\\n', '\n')
 
                     content_blocks.append({
                         "type": "tool_use",

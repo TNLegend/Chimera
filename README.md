@@ -107,4 +107,4 @@ Google Gemini's Web UI is strictly **stateful**. It tracks a specific `Chat ID` 
 3. Performing a "Delta Slice" when Claude sends its massive payload, extracting only the brand new user text and tool results.
 4. Sending only that lean, sliced delta to Google's stateful endpoint.
 5. Catching Google's raw JSON response, repairing any malformed `<TOOL_CALL>` artifacts, and feeding it seamlessly back to Claude's terminal UI.
-```
+
